@@ -1,0 +1,69 @@
+# TaF-Adapter reproduction config.
+# Except for window_size=5 and the Eq. (1)--(11) structure, numeric values below
+# are initial experimental choices because the paper does not publish them.
+
+data:
+  root_dir: null
+  window_size: 5                 # The paper reports N=5.
+  stride: 1
+  image_size: [224, 224]
+  max_sequences: null
+  sensor_types: null
+  split_seed: 42
+  split_unit: "sequence"         # "sequence" or "episode"; never split windows.
+  validation_fraction: 0.1
+  skip_invalid_sequences: false  # Training refuses silently skipped sequences.
+  alignment_decode_windows_per_episode: 1
+  normalization_eps: 1.0e-6
+  normalization_chunk_frames: 8192
+
+force_encoder:
+  hidden_dim: 512
+  pressure_latent_dim: 128
+  force_latent_dim: 128
+  mlp_layers: 2
+
+vq:
+  pressure_codebook_size: 512
+  force_codebook_size: 512
+  commitment_beta: 0.25
+
+tactile_encoder:
+  # Verified in the installed timm 1.0.30 registry. AugReg ImageNet-21k
+  # pretraining followed by ImageNet-1k fine-tuning; exact backbone/init/freeze
+  # choices are not disclosed by TaF-VLA.
+  backbone: "vit_small_patch16_224.augreg_in21k_ft_in1k"
+  pretrained: true
+  freeze_backbone: true
+  transformer_dim: 256
+  transformer_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  max_window_size: 20
+
+loss:
+  lambda_quant: 1.0
+  lambda_recon: 1.0
+  commitment_beta: 0.25
+  temperature: 0.07
+  # "paper" implements Eq. (10), tactile->force only. "symmetric" averages
+  # tactile->force and force->tactile, matching the prose description.
+  nce_mode: "paper"
+
+training:
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  max_steps: 10000
+  num_workers: 4
+  seed: 42
+  amp: true
+  grad_clip_norm: 1.0
+  log_every: 20
+  validate_every: 500
+  validation_batches: 50
+  save_every: 1000
+  output_dir: "outputs/taf_adapter"
+  # Gradient accumulation does not increase the number of InfoNCE negatives.
+  min_same_episode_window_gap: 5
