@@ -2,44 +2,27 @@
 
 from __future__ import annotations
 
-import argparse
-import copy
 import math
-import sys
-from pathlib import Path
-from typing import Any
 
+import hydra
 import torch
-import yaml
+from omegaconf import DictConfig
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model.taf_adapter import TaFAdapter
 from model.vector_quantizer import VectorQuantizer
+from utils.common import validate_config
+from utils.config import register_config_schema
+from utils.model_factory import build_model
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    with path.open() as handle:
-        return yaml.safe_load(handle)
-
-
-def build_model(config: dict[str, Any], window_size: int) -> TaFAdapter:
-    tactile = dict(config["tactile_encoder"])
-    tactile["max_window_size"] = max(int(tactile.get("max_window_size", window_size)), window_size)
-    return TaFAdapter(
-        window_size=window_size,
-        force_encoder=config["force_encoder"],
-        vq=config["vq"],
-        tactile_encoder=tactile,
-        loss=config["loss"],
-        normalization_eps=float(config["data"].get("normalization_eps", 1e-6)),
-    )
+register_config_schema()
 
 
 def has_finite_nonzero_gradient(module: torch.nn.Module) -> bool:
     gradients = [parameter.grad for parameter in module.parameters() if parameter.requires_grad]
-    return bool(gradients) and all(g is not None and torch.isfinite(g).all() for g in gradients) and any(
-        g.abs().sum() > 0 for g in gradients
-    )
+    return bool(gradients) and all(
+        gradient is not None and torch.isfinite(gradient).all() for gradient in gradients
+    ) and any(gradient.abs().sum() > 0 for gradient in gradients)
 
 
 def check_vq_gradient_routing(device: torch.device) -> None:
@@ -79,13 +62,14 @@ def check_causality(model: TaFAdapter, device: torch.device) -> None:
         assert torch.allclose(baseline[:, :-2], perturbed[:, :-2], atol=2e-5, rtol=2e-5), (
             "A future frame changed an earlier token; causal masking is not effective"
         )
-    summary_change = (baseline[:, -1] - perturbed[:, -1]).abs().max()
-    assert summary_change > 1e-6, "Summary token did not respond to a past tactile frame"
+    assert (baseline[:, -1] - perturbed[:, -1]).abs().max() > 1e-6, (
+        "Summary token did not respond to a past tactile frame"
+    )
     print("Causal mask and last-position summary access: PASS")
 
 
 def check_one_window(
-    model: TaFAdapter, window_size: int, device: torch.device, image_size: tuple[int, int]
+    model: TaFAdapter, window_size: int, device: torch.device, image_size: tuple[int, int],
 ) -> None:
     model.train()
     batch = 2
@@ -102,12 +86,12 @@ def check_one_window(
     for name, value in outputs.items():
         if name.startswith("loss_"):
             assert torch.isfinite(value).all(), f"{name} is not finite"
-    p_indices = outputs["codebook_indices"]["pressure"]
-    f_indices = outputs["codebook_indices"]["force"]
-    assert int(p_indices.min()) >= 0
-    assert int(p_indices.max()) < model.force_encoder.pressure.quantizer.codebook.num_embeddings
-    assert int(f_indices.min()) >= 0
-    assert int(f_indices.max()) < model.force_encoder.force.quantizer.codebook.num_embeddings
+    pressure_indices = outputs["codebook_indices"]["pressure"]
+    force_indices = outputs["codebook_indices"]["force"]
+    assert int(pressure_indices.min()) >= 0
+    assert int(pressure_indices.max()) < model.force_encoder.pressure.quantizer.codebook.num_embeddings
+    assert int(force_indices.min()) >= 0
+    assert int(force_indices.max()) < model.force_encoder.force.quantizer.codebook.num_embeddings
 
     outputs["loss_total"].backward()
     assert has_finite_nonzero_gradient(model.force_encoder.pressure.encoder)
@@ -169,33 +153,30 @@ def synthetic_overfit(model: TaFAdapter, device: torch.device, steps: int) -> No
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=Path("config/taf_adapter.yaml"))
-    parser.add_argument("--overfit-steps", type=int, default=100)
-    parser.add_argument("--skip-overfit", action="store_true")
-    parser.add_argument(
-        "--no-pretrained", action="store_true",
-        help="explicitly use random ViT weights for offline structural testing; never automatic",
-    )
-    args = parser.parse_args()
-    config = load_config(args.config)
-    if args.no_pretrained:
-        config = copy.deepcopy(config)
-        config["tactile_encoder"]["pretrained"] = False
-        print("NOTE: --no-pretrained explicitly selected; this is not a pretrained-backbone validation")
-
-    torch.manual_seed(int(config["training"]["seed"]))
+def run_checks(cfg: DictConfig) -> None:
+    validate_config(cfg)
+    torch.manual_seed(int(cfg.training.seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_size = tuple(config["data"]["image_size"])
+    image_size = tuple(cfg.data.image_size)
+    pretrained = False if cfg.check.no_pretrained else bool(cfg.tactile_encoder.pretrained)
     print(f"Device: {device}")
+    if not pretrained:
+        print("NOTE: pretrained weights are disabled; this is a structural model validation")
     check_vq_gradient_routing(device)
+
     retained_model = None
-    # Keep T=5 last so its model can be reused by the overfit test.
-    for window_size in (1, 3, 10, 5):
-        model = build_model(config, window_size).to(device)
+    target_window = int(cfg.data.window_size)
+    window_sizes = [int(value) for value in cfg.check.window_sizes]
+    if target_window in window_sizes:
+        window_sizes.remove(target_window)
+    window_sizes.append(target_window)
+    for window_size in window_sizes:
+        model = build_model(cfg, window_size=window_size, pretrained=pretrained).to(device)
+        expected_beta = float(cfg.vq.commitment_beta)
+        assert model.force_encoder.pressure.quantizer.commitment_beta == expected_beta
+        assert model.force_encoder.force.quantizer.commitment_beta == expected_beta
         check_one_window(model, window_size, device, image_size)
-        if window_size == 5:
+        if window_size == target_window:
             retained_model = model
         else:
             del model
@@ -205,13 +186,18 @@ def main() -> None:
     check_causality(retained_model, device)
     encoder = retained_model.tactile_encoder
     print(
-        f"Backbone: {encoder.backbone_name}; pretrained={config['tactile_encoder']['pretrained']}; "
+        f"Backbone: {encoder.backbone_name}; pretrained={pretrained}; "
         f"features={encoder.backbone_dim}; input={encoder.input_size}; "
         f"mean={encoder.pixel_mean.flatten().tolist()}; std={encoder.pixel_std.flatten().tolist()}"
     )
-    if not args.skip_overfit:
-        synthetic_overfit(retained_model, device, args.overfit_steps)
+    if not cfg.check.skip_overfit:
+        synthetic_overfit(retained_model, device, int(cfg.check.overfit_steps))
     print("All requested model checks: PASS")
+
+
+@hydra.main(version_base="1.3", config_path="../config", config_name="taf_adapter")
+def main(cfg: DictConfig) -> None:
+    run_checks(cfg)
 
 
 if __name__ == "__main__":

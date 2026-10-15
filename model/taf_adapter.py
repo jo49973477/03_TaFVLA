@@ -36,13 +36,9 @@ class TaFAdapter(nn.Module):
         vq_cfg = dict(vq or {})
         tactile_cfg = dict(tactile_encoder or {})
         loss_cfg = dict(loss or {})
-        if (
-            "commitment_beta" in vq_cfg
-            and "commitment_beta" in loss_cfg
-            and float(vq_cfg["commitment_beta"]) != float(loss_cfg["commitment_beta"])
-        ):
-            raise ValueError("vq.commitment_beta and loss.commitment_beta must match")
-        beta = float(loss_cfg.get("commitment_beta", vq_cfg.get("commitment_beta", 0.25)))
+        # vq.commitment_beta is canonical. The fallback preserves direct legacy
+        # constructor calls that provided it under loss instead.
+        beta = float(vq_cfg.get("commitment_beta", loss_cfg.get("commitment_beta", 0.25)))
         self.force_encoder = ForceEncoder(
             window_size=window_size,
             hidden_dim=int(force_cfg.get("hidden_dim", 512)),
