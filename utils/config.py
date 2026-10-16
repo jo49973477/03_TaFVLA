@@ -24,6 +24,9 @@ class DataConfig:
     split_unit: str = "sequence"
     validation_fraction: float = 0.1
     skip_invalid_sequences: bool = False
+    timestamp_cache_enabled: bool = True
+    timestamp_cache_dir: Optional[str] = None
+    show_initialization_progress: bool = True
     alignment_decode_windows_per_episode: int = 1
     normalization_eps: float = 1.0e-6
     normalization_chunk_frames: int = 8192
@@ -98,6 +101,19 @@ class WandbConfig:
 
 
 @dataclass
+class AlignmentEvalConfig:
+    enabled: bool = True
+    retrieval_every_n_epochs: int = 1
+    visualize_every_n_epochs: int = 5
+    retrieval_max_pairs: int = 256
+    visualization_max_pairs: int = 64
+    min_window_start_gap: int = 5
+    random_seed: int = 42
+    run_on_training_end: bool = True
+    save_local_figures: bool = True
+
+
+@dataclass
 class CheckConfig:
     overfit_steps: int = 100
     skip_overfit: bool = False
@@ -114,6 +130,7 @@ class TaFConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    alignment_eval: AlignmentEvalConfig = field(default_factory=AlignmentEvalConfig)
     check: CheckConfig = field(default_factory=CheckConfig)
 
 

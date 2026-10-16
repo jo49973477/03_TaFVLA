@@ -147,6 +147,52 @@ windows from every episode and refuses to proceed if an invalid sequence was
 skipped. Train/validation splitting happens at sequence or episode granularity,
 never at window granularity.
 
+### Persistent video timestamp cache
+
+Dataset construction still obtains every presentation timestamp with the exact
+`ffprobe -show_frames` strategy used for temporal alignment; timestamps are
+never estimated from FPS or frame number. The first request for each
+metadata-referenced MP4 stores the ordered `float64` result under
+`${XDG_CACHE_HOME:-~/.cache}/taf-vla/video_timestamps/`. A later run validates
+the canonical absolute path, file size, nanosecond modification time, cache
+format version, extraction-strategy version, array shape/dtype/finiteness,
+strict ordering, and an array checksum before accepting a hit.
+
+Each video is committed immediately as one `.npz` via a temporary file and
+atomic rename. A per-video file lock makes concurrent initializers re-check the
+finished cache instead of reading partial data. Consequently, Ctrl+C preserves
+all videos completed before the interrupted probe. Stale or corrupt entries are
+regenerated independently and do not require clearing the whole cache. The
+source dataset is never modified.
+
+The initialization UI counts only MP4s referenced by the selected LeRobot
+metadata. On an interactive TTY it uses fixed-position tqdm rows for sequences,
+videos, elapsed time/ETA, and cache hit/miss/failure counts. Non-TTY jobs emit
+sparse plain-text summaries without ANSI cursor control. Configure this through
+Hydra:
+
+```yaml
+data:
+  timestamp_cache_enabled: true
+  timestamp_cache_dir: null
+  show_initialization_progress: true
+```
+
+`script.check_dataset` reuses the same default cache. Its corresponding flags
+are `--[no-]timestamp-cache-enabled`, `--timestamp-cache-dir`, and
+`--[no-]show-initialization-progress`. Disabling the cache runs the same
+ffprobe extraction every time.
+
+Some TaF-Dataset distributions omit `meta/episodes` for otherwise complete
+sequences. The loader uses official episode metadata whenever it exists. If it
+is missing, a deliberately narrow fallback supports only one data Parquet and
+one `observation.image` MP4. It reconstructs boundaries in memory only after
+checking contiguous global indices, episode IDs, per-episode frame indices,
+timestamps, FPS, `total_frames`, `total_episodes`, and `info.json` path
+templates. The normal ffprobe timestamp tolerance and one-to-one frame mapping
+checks still run afterward. A warning identifies every reconstructed sequence;
+no file is added to or changed in the source dataset.
+
 Pressure mean/std is stored per 12x12 taxel and wrench mean/std per ordered 6D
 component. Statistics use unique frames from the training groups only, not
 overlapping windows and never validation data. They are stored both in model
@@ -157,7 +203,8 @@ continuous dataset. Gradient accumulation also does not enlarge the InfoNCE
 negative set: only pairs in one forward pass are negatives.
 
 Checkpoints contain model/optimizer/scaler state, normalization, split groups,
-config, step/epoch, and RNG state. Resume with:
+config, step/epoch, alignment-evaluation state, and RNG state. Older checkpoints
+without alignment metadata remain loadable. Resume with:
 
 ```bash
 uv run python -m script.train_adapter \
@@ -165,8 +212,9 @@ uv run python -m script.train_adapter \
   training.resume=outputs/taf_adapter/last.pt
 ```
 
-Metrics are printed and appended to
-`outputs/taf_adapter/metrics.jsonl` by default.
+Metrics are appended to `outputs/taf_adapter/metrics.jsonl` by default. An
+interactive terminal shows optimizer progress and a fixed training/validation
+dashboard instead of printing each JSON dictionary.
 
 ## Weights & Biases
 
@@ -193,13 +241,40 @@ uv run python -m script.train_adapter \
 
 The final resolved Hydra config and the W&B run ID/name are recorded. Training
 and validation log total, InfoNCE, quantization, codebook, commitment, pressure
-and force reconstruction losses; positive/negative cosine; recall@1/5; both
-codebooks' used count, usage fraction, perplexity, and dead-code count. W&B
-also receives learning rate, gradient norm, epoch, elapsed time, and the actual
-optimizer step as its global step. No additional model forward pass is made for
-logging, and datasets/checkpoints are not uploaded as artifacts.
+and force reconstruction losses; positive/negative cosine; recall@1/5; and
+pressure/force codebook perplexity. Detailed codebook used count, usage
+fraction, and dead-code count are intentionally excluded from W&B, but the
+model still computes them and the unfiltered values remain in `metrics.jsonl`.
+W&B also receives learning rate, gradient norm, epoch, elapsed time, and the
+actual optimizer step as its global step. No additional model forward pass is
+made for logging, and datasets/checkpoints are not uploaded as artifacts.
 
-`training.log_every` controls console and JSONL aggregation,
+W&B's Python SDK can define a common step metric, but does not reliably impose
+a particular multi-run workspace panel layout. The logger therefore uploads
+each native scalar once and never re-uploads the complete history as a custom
+chart. In a run workspace, use **Add panel → Line plot**, choose
+`global_step` for X, and select these Y series:
+
+- **Training Loss Components**: `train/loss_total`, `train/loss_nce`,
+  `train/loss_quant`, `train/loss_recon`
+- **Validation Loss Components**: `val/loss_total`, `val/loss_nce`,
+  `val/loss_quant`, `val/loss_recon`
+- **Training Codebook Perplexity**: `train/pressure_codebook_perplexity`,
+  `train/force_codebook_perplexity`
+- **Validation Codebook Perplexity**: `val/pressure_codebook_perplexity`,
+  `val/force_codebook_perplexity`
+- **Cross-Modal Retrieval**: `alignment/t2f/recall_at_1`,
+  `alignment/t2f/recall_at_5`, `alignment/t2f/mrr`,
+  `alignment/t2f/hard_negative_margin` with `completed_epoch` as X
+
+Alignment images are logged under `alignment/visualization/*` with both
+`completed_epoch` and the actual optimizer `global_step` in their record and
+caption.
+
+Each panel overlays the listed series on one chart. The `define_metric` calls
+bind both `train/*` and `val/*` histories to the same monotonic `global_step`.
+
+`training.log_every` controls terminal dashboard and JSONL aggregation,
 `training.validate_every` controls validation, and `wandb.log_every` controls
 training metric uploads to W&B. Validation uses its current optimizer step and
 is merged into the same W&B log call when the intervals coincide. A checkpoint
@@ -207,6 +282,91 @@ stores the W&B run ID; resume continues that run when present, while older
 checkpoints without the field start a new run. Online initialization errors are
 reported rather than silently changing mode. Normal and exceptional shutdowns
 call `wandb.finish()` after successful initialization.
+
+On a TTY, tqdm reserves one progress row and eight fixed metric rows for loss,
+validation, and cross-modal retrieval. Progress
+counts completed optimizer updates, so gradient-accumulation micro-steps do not
+advance it; resume starts at the checkpoint step. Elapsed time, ETA, completion
+percentage, and steps/second are shown by the progress row. In non-TTY contexts
+(redirected output, CI, or a terminal multiplexer without usable TTY support),
+ANSI cursor movement is disabled and a plain-text summary is emitted only at
+the configured logging/validation intervals.
+
+## Cross-modal alignment evaluation
+
+Training uses mini-batch InfoNCE diagnostics, while the alignment evaluator uses
+a separate, fixed validation candidate set. It extracts the model's
+`z_tactile` and `c_force` under `model.eval()` and `torch.inference_mode()`, L2
+normalizes both, and computes the complete cosine matrix
+`S = z_tactile @ c_force.T`. Metrics are reported for both tactile→force and
+force→tactile:
+
+- Recall@1 and Recall@5 over the complete fixed candidate set
+- mean reciprocal rank (MRR)
+- mean matched-pair and non-matched-pair cosine similarity
+- mean matched similarity minus the hardest negative similarity
+
+Only validation indices produced by the existing group split are eligible.
+Within one episode, selected window starts are separated by at least
+`max(alignment_eval.min_window_start_gap, data.window_size)`. Episode queues are
+sampled round-robin with a local fixed seed, and the exact global indices,
+episode identifiers, starts, effective gap, and seed are saved to
+`outputs/taf_adapter/alignment/validation_selection.json`. This removes direct
+frame overlap, but temporally distant windows can still represent the same
+physical force state. Retrieval scores must therefore not be interpreted as a
+perfect semantic-duplicate-free benchmark.
+
+The default configuration is:
+
+```yaml
+alignment_eval:
+  enabled: true
+  retrieval_every_n_epochs: 1
+  visualize_every_n_epochs: 5
+  retrieval_max_pairs: 256
+  visualization_max_pairs: 64
+  min_window_start_gap: 5
+  random_seed: 42
+  run_on_training_end: true
+  save_local_figures: true
+```
+
+Options are regular Hydra overrides:
+
+```fish
+uv run python -m script.train_adapter \
+    data.root_dir=/path/to/TaF-Dataset \
+    alignment_eval.visualize_every_n_epochs=10
+
+uv run python -m script.train_adapter \
+    data.root_dir=/path/to/TaF-Dataset \
+    alignment_eval.enabled=false
+```
+
+An epoch metric is emitted only after every training batch for that epoch was
+consumed. `completed_epoch` is 1-based and is stored in checkpoints. If
+`max_steps` stops inside an epoch, `run_on_training_end=true` performs a
+retrieval-only record labeled `final`; if no epoch completed, the terminal UI
+explicitly shows `Final (no completed epoch)`. An evaluation already performed
+at the same final model step is not duplicated.
+
+Every visualization interval produces:
+
+- `epoch_XXXX_similarity.png`: tactile rows × force/pressure columns, fixed
+  cosine range `[-1, 1]`; matched pairs lie on the diagonal.
+- `epoch_XXXX_umap.png`: one joint UMAP fit over both modalities, with matching
+  indices connected. Each epoch refits UMAP, so coordinates across epochs are
+  not a quantitative distance measure.
+- `epoch_XXXX_distribution.png`: density-normalized positive, negative, and
+  hard-negative cosine distributions with positive/negative means.
+
+PNG files are saved under `outputs/taf_adapter/alignment/` and the same rendered
+images are uploaded once at their evaluation step when W&B is enabled. UMAP is
+CPU-side and requires `umap-learn`; install a missing dependency with
+`uv add umap-learn`. Runtime is dominated by encoding at most
+`retrieval_max_pairs` windows, an `N×N` cosine matrix, and periodic UMAP over at
+most twice `visualization_max_pairs` points. Embeddings are moved to CPU and all
+Matplotlib figures are closed after rendering.
 
 ## Reproduction boundary
 

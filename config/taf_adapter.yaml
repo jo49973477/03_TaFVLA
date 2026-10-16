@@ -17,6 +17,10 @@ data:
   split_unit: "sequence"         # "sequence" or "episode"; never split windows.
   validation_fraction: 0.1
   skip_invalid_sequences: false  # Training refuses silently skipped sequences.
+  timestamp_cache_enabled: true
+  # null -> ${XDG_CACHE_HOME:-~/.cache}/taf-vla/video_timestamps/
+  timestamp_cache_dir: null
+  show_initialization_progress: true
   alignment_decode_windows_per_episode: 1
   normalization_eps: 1.0e-6
   normalization_chunk_frames: 8192
@@ -54,7 +58,7 @@ loss:
   nce_mode: "paper"
 
 training:
-  batch_size: 32
+  batch_size: 64
   gradient_accumulation_steps: 1
   learning_rate: 0.0001
   weight_decay: 0.00001
@@ -63,6 +67,7 @@ training:
   seed: 42
   amp: true
   grad_clip_norm: 1.0
+  # TTY: fixed-position tqdm dashboard; non-TTY: periodic plain-text summary.
   log_every: 20
   validate_every: 500
   validation_batches: 50
@@ -80,8 +85,23 @@ wandb:
   group: null
   tags: ["taf-vla", "pretraining"]
   mode: "online"
+  # Native scalar histories use global_step; README explains overlay panels.
+  # W&B keeps only pressure/force perplexity for codebook diversity, while
+  # metrics.jsonl retains every codebook diagnostic.
   log_every: 20
   watch_model: false
+
+alignment_eval:
+  enabled: true
+  retrieval_every_n_epochs: 1
+  visualize_every_n_epochs: 5
+  retrieval_max_pairs: 256
+  visualization_max_pairs: 64
+  # 실제 적용 간격은 temporal overlap 방지를 위해 max(이 값, window_size)이다.
+  min_window_start_gap: 5
+  random_seed: 42
+  run_on_training_end: true
+  save_local_figures: true
 
 check:
   overfit_steps: 100

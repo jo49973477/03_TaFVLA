@@ -49,6 +49,7 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler, step: int, epoch: int, config: DictConfig | dict[str, Any],
     normalization: dict[str, torch.Tensor], train_keys: list[str], val_keys: list[str],
     wandb_state: dict[str, Any] | None = None,
+    alignment_state: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -64,6 +65,8 @@ def save_checkpoint(
     }
     if wandb_state:
         payload["wandb"] = dict(wandb_state)
+    if alignment_state is not None:
+        payload["alignment"] = dict(alignment_state)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)

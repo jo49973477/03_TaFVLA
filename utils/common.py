@@ -18,7 +18,8 @@ _CONFIG_KEYS = {
     "data": {
         "root_dir", "window_size", "stride", "image_size", "max_sequences",
         "sensor_types", "split_seed", "split_unit", "validation_fraction",
-        "skip_invalid_sequences", "alignment_decode_windows_per_episode",
+        "skip_invalid_sequences", "timestamp_cache_enabled", "timestamp_cache_dir",
+        "show_initialization_progress", "alignment_decode_windows_per_episode",
         "normalization_eps", "normalization_chunk_frames",
     },
     "force_encoder": {
@@ -39,6 +40,11 @@ _CONFIG_KEYS = {
     "wandb": {
         "enabled", "project", "entity", "name", "group", "tags", "mode",
         "log_every", "watch_model",
+    },
+    "alignment_eval": {
+        "enabled", "retrieval_every_n_epochs", "visualize_every_n_epochs",
+        "retrieval_max_pairs", "visualization_max_pairs", "min_window_start_gap",
+        "random_seed", "run_on_training_end", "save_local_figures",
     },
     "check": {"overfit_steps", "skip_overfit", "no_pretrained", "window_sizes"},
 }
@@ -149,6 +155,12 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("data.validation_fraction must be between 0 and 1")
     _boolean(data.skip_invalid_sequences, "data.skip_invalid_sequences")
+    _boolean(data.timestamp_cache_enabled, "data.timestamp_cache_enabled")
+    if data.timestamp_cache_dir is not None and (
+        not isinstance(data.timestamp_cache_dir, str) or not data.timestamp_cache_dir
+    ):
+        raise TypeError("data.timestamp_cache_dir must be null or a non-empty path string")
+    _boolean(data.show_initialization_progress, "data.show_initialization_progress")
     _integer(
         data.alignment_decode_windows_per_episode,
         "data.alignment_decode_windows_per_episode", minimum=1,
@@ -229,6 +241,36 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise ValueError("wandb.mode must be 'online' or 'offline'")
     _integer(wandb.log_every, "wandb.log_every", minimum=1)
     _boolean(wandb.watch_model, "wandb.watch_model")
+
+    alignment = sections["alignment_eval"]
+    _boolean(alignment.enabled, "alignment_eval.enabled")
+    _integer(
+        alignment.retrieval_every_n_epochs,
+        "alignment_eval.retrieval_every_n_epochs", minimum=1,
+    )
+    _integer(
+        alignment.visualize_every_n_epochs,
+        "alignment_eval.visualize_every_n_epochs", minimum=1,
+    )
+    retrieval_pairs = _integer(
+        alignment.retrieval_max_pairs,
+        "alignment_eval.retrieval_max_pairs", minimum=2,
+    )
+    visualization_pairs = _integer(
+        alignment.visualization_max_pairs,
+        "alignment_eval.visualization_max_pairs", minimum=2,
+    )
+    if visualization_pairs > retrieval_pairs:
+        raise ValueError(
+            "alignment_eval.visualization_max_pairs must not exceed retrieval_max_pairs"
+        )
+    _integer(
+        alignment.min_window_start_gap,
+        "alignment_eval.min_window_start_gap", minimum=1,
+    )
+    _integer(alignment.random_seed, "alignment_eval.random_seed", minimum=0)
+    _boolean(alignment.run_on_training_end, "alignment_eval.run_on_training_end")
+    _boolean(alignment.save_local_figures, "alignment_eval.save_local_figures")
 
     check = sections["check"]
     _integer(check.overfit_steps, "check.overfit_steps", minimum=1)
