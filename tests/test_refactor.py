@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,11 +17,18 @@ from hydra.errors import ConfigCompositionException
 from omegaconf import OmegaConf
 
 from model.taf_adapter import TaFAdapter
+from script.train_adapter import validate
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.common import validate_config
 from utils.config import register_config_schema
-from utils.data import TemporalDiverseBatchSampler, split_by_group
+from utils.data import (
+    FixedValidationBatchSampler,
+    TemporalDiverseBatchSampler,
+    split_by_group,
+    temporal_batch_violations,
+)
 from utils.logging import ExperimentLogger, TrainingProgress
+from utils.logging import METRIC_KEYS
 from utils.model_factory import build_model
 
 
@@ -50,6 +58,17 @@ class _FakeDataset:
             previous = end
         raise IndexError(index)
 
+    def __len__(self) -> int:
+        return self._ends[-1]
+
+    def __getitem__(self, index: int):
+        value = float(index)
+        return {
+            "tactile": torch.tensor([value]),
+            "force": torch.tensor([value]),
+            "pressure": torch.tensor([value]),
+        }
+
 
 class RefactorSmokeTests(unittest.TestCase):
     def test_hydra_override_and_semantic_validation(self) -> None:
@@ -62,6 +81,7 @@ class RefactorSmokeTests(unittest.TestCase):
         self.assertEqual(config.training.batch_size, 16)
         self.assertNotIn("commitment_beta", config.loss)
         self.assertTrue(config.alignment_eval.enabled)
+        self.assertEqual(config.alignment_eval.retrieval_every_n_steps, 1000)
         self.assertTrue(config.data.timestamp_cache_enabled)
         self.assertIsNone(config.data.timestamp_cache_dir)
         self.assertTrue(config.data.show_initialization_progress)
@@ -84,6 +104,12 @@ class RefactorSmokeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "visualization_max_pairs"):
             validate_config(invalid_alignment)
+
+        invalid_step_schedule = compose_config(
+            "alignment_eval.retrieval_every_n_steps=-1",
+        )
+        with self.assertRaisesRegex(ValueError, "retrieval_every_n_steps"):
+            validate_config(invalid_step_schedule)
 
         cache_override = compose_config(
             "data.timestamp_cache_enabled=false",
@@ -118,6 +144,54 @@ class RefactorSmokeTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(sorted(index for batch in first for index in batch), indices)
 
+    def test_fixed_validation_sampler_is_strict_deterministic_and_reports_drops(self) -> None:
+        dataset = _FakeDataset()
+        indices = list(range(10))
+        first = FixedValidationBatchSampler(dataset, indices, 4, 2, 7)
+        second = FixedValidationBatchSampler(dataset, indices, 4, 2, 7)
+        first_batches = list(first)
+        self.assertEqual(first_batches, list(second))
+        self.assertEqual(first.report.batch_size, 4)
+        self.assertEqual(first.report.used_samples, 8)
+        self.assertEqual(first.report.dropped_samples, 2)
+        self.assertEqual(first.report.violating_batches, 0)
+        self.assertTrue(all(len(batch) == 4 for batch in first_batches))
+        used = [index for batch in first_batches for index in batch]
+        self.assertEqual(
+            sorted(used + first.dropped_local_indices), indices,
+        )
+        self.assertEqual(len(set(used + first.dropped_local_indices)), len(indices))
+        self.assertEqual(
+            temporal_batch_violations(dataset, indices, first_batches, 2), []
+        )
+
+        violations = temporal_batch_violations(
+            dataset, indices, [[0, 1], [3, 6]], 2,
+        )
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0]["window_start_gap"], 1)
+
+    def test_fixed_validation_sampler_reports_impossible_full_batch(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "cannot form one full"):
+            FixedValidationBatchSampler(_FakeDataset(), list(range(10)), 6, 2, 7)
+
+    def test_repeated_fixed_validation_has_identical_results(self) -> None:
+        class MetricModel(torch.nn.Module):
+            def forward(self, *, tactile, force, pressure):
+                value = (tactile.float().mean() + force.float().mean()) / 2
+                return {key: value for key in METRIC_KEYS}
+
+        dataset = _FakeDataset()
+        indices = list(range(10))
+        sampler = FixedValidationBatchSampler(dataset, indices, 4, 2, 7)
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, indices), batch_sampler=sampler,
+        )
+        model = MetricModel()
+        first = validate(model, loader, torch.device("cpu"), False, 2)
+        second = validate(model, loader, torch.device("cpu"), False, 2)
+        self.assertEqual(first, second)
+
     def test_checkpoint_roundtrip_and_legacy_load(self) -> None:
         config = compose_config()
         model = torch.nn.Linear(2, 1)
@@ -142,6 +216,7 @@ class RefactorSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint["step"], 12)
             self.assertEqual(checkpoint["wandb"]["run_id"], "offline-id")
             self.assertEqual(checkpoint["alignment"]["completed_epochs"], 2)
+            self.assertEqual(checkpoint["alignment"]["sample_indices"], [4, 8])
 
             legacy_path = Path(directory) / "legacy.pt"
             torch.save({"model": model.state_dict(), "step": 4}, legacy_path)
@@ -296,6 +371,37 @@ class RefactorSmokeTests(unittest.TestCase):
             self.assertEqual(saved["train/pressure_codebook_usage"], 4.0)
             self.assertEqual(saved["val/force_dead_codes"], 13.0)
             self.assertEqual(logger.progress.current_step, 5)
+            logger.finish()
+
+    def test_wandb_alignment_metrics_use_global_optimizer_step(self) -> None:
+        class FakeRun:
+            id = "run-id"
+            name = "run-name"
+
+            def __init__(self) -> None:
+                self.definitions = []
+
+            def define_metric(self, name, **kwargs) -> None:
+                self.definitions.append((name, kwargs))
+
+            def finish(self, exit_code=0) -> None:
+                pass
+
+        fake_run = FakeRun()
+        fake_wandb = SimpleNamespace(init=lambda **kwargs: fake_run)
+        config = compose_config("wandb.enabled=true", "wandb.mode=offline")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, {"wandb": fake_wandb},
+        ):
+            logger = ExperimentLogger(Path(directory), config.wandb)
+            logger.start(config, torch.nn.Linear(1, 1))
+            definitions = dict(fake_run.definitions)
+            self.assertEqual(
+                definitions["alignment/t2f/*"]["step_metric"], "global_step"
+            )
+            self.assertEqual(
+                definitions["alignment/f2t/*"]["step_metric"], "global_step"
+            )
             logger.finish()
 
     def test_tty_dashboard_uses_fixed_positions_and_refreshes_in_place(self) -> None:

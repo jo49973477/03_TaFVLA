@@ -103,6 +103,7 @@ class WandbConfig:
 @dataclass
 class AlignmentEvalConfig:
     enabled: bool = True
+    retrieval_every_n_steps: int = 1000
     retrieval_every_n_epochs: int = 1
     visualize_every_n_epochs: int = 5
     retrieval_max_pairs: int = 256

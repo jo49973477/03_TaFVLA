@@ -6,6 +6,7 @@ import math
 import random
 from collections import defaultdict, deque
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
@@ -183,4 +184,160 @@ class TemporalDiverseBatchSampler(Sampler[list[int]]):
                 selected.append(queue.popleft())
             if len(selected) >= 2:
                 yield [item[0] for item in selected]
+
+
+@dataclass(frozen=True)
+class ValidationSamplingReport:
+    """Diagnostics for a fixed, full-size validation batch plan."""
+
+    seed: int
+    batch_size: int
+    min_window_start_gap: int
+    candidate_samples: int
+    used_samples: int
+    dropped_samples: int
+    batch_count: int
+    violating_batches: int
+
+    def as_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+def temporal_batch_violations(
+    dataset: TaFDataset,
+    subset_indices: list[int],
+    batches: list[list[int]],
+    min_gap: int,
+) -> list[dict[str, int]]:
+    """Return every same-episode pair that violates ``min_gap``.
+
+    Batch indices are local to ``Subset(dataset, subset_indices)`` so this also
+    audits the exact indices consumed by a DataLoader batch sampler.
+    """
+    episode_ids = {id(episode): index for index, episode in enumerate(dataset.episodes)}
+    located: dict[int, tuple[int, int]] = {}
+    for local_index, global_index in enumerate(subset_indices):
+        episode, start = dataset._locate(global_index)
+        located[local_index] = (episode_ids[id(episode)], int(start))
+
+    violations: list[dict[str, int]] = []
+    for batch_index, batch in enumerate(batches):
+        for left_offset, left_local in enumerate(batch):
+            left_episode, left_start = located[left_local]
+            for right_local in batch[left_offset + 1:]:
+                right_episode, right_start = located[right_local]
+                distance = abs(left_start - right_start)
+                if left_episode == right_episode and distance < min_gap:
+                    violations.append({
+                        "batch_index": batch_index,
+                        "left_local_index": left_local,
+                        "right_local_index": right_local,
+                        "episode_list_index": left_episode,
+                        "left_window_start": left_start,
+                        "right_window_start": right_start,
+                        "window_start_gap": distance,
+                    })
+    return violations
+
+
+class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
+    """Build deterministic, strict temporal batches once for all evaluations.
+
+    Unlike the training sampler, this evaluation-only variant never relaxes the
+    temporal constraint and never emits a partial InfoNCE batch. Candidates that
+    cannot be packed into a full compatible batch are explicitly reported.
+    """
+
+    def __init__(
+        self,
+        dataset: TaFDataset,
+        subset_indices: list[int],
+        batch_size: int,
+        min_gap: int,
+        seed: int,
+    ) -> None:
+        super().__init__(dataset, subset_indices, batch_size, min_gap, seed)
+        self._batches, dropped = self._build_fixed_batches()
+        violations = temporal_batch_violations(
+            dataset, subset_indices, self._batches, self.min_gap,
+        )
+        self.report = ValidationSamplingReport(
+            seed=self.seed,
+            batch_size=self.batch_size,
+            min_window_start_gap=self.min_gap,
+            candidate_samples=len(self.items),
+            used_samples=sum(map(len, self._batches)),
+            dropped_samples=len(dropped),
+            batch_count=len(self._batches),
+            violating_batches=len({item["batch_index"] for item in violations}),
+        )
+        self.dropped_local_indices = [item[0] for item in dropped]
+        self.violations = violations
+        if violations:
+            first = violations[0]
+            raise RuntimeError(
+                "Fixed validation sampler produced a temporal-gap violation: "
+                f"batch={first['batch_index']}, episode={first['episode_list_index']}, "
+                f"starts=({first['left_window_start']}, "
+                f"{first['right_window_start']}), gap={first['window_start_gap']} "
+                f"< required {self.min_gap}"
+            )
+        if not self._batches:
+            raise RuntimeError(
+                "Validation cannot form one full temporally diverse InfoNCE batch: "
+                f"candidates={len(self.items)}, batch_size={self.batch_size}, "
+                f"required_same_episode_gap={self.min_gap}."
+            )
+
+    @staticmethod
+    def _compatible(
+        item: tuple[int, int, int],
+        selected: list[tuple[int, int, int]],
+        min_gap: int,
+    ) -> bool:
+        return all(
+            item[1] != other[1] or abs(item[2] - other[2]) >= min_gap
+            for other in selected
+        )
+
+    def _build_fixed_batches(
+        self,
+    ) -> tuple[list[list[int]], list[tuple[int, int, int]]]:
+        remaining = list(self.items)
+        random.Random(self.seed).shuffle(remaining)
+        batches: list[list[int]] = []
+        dropped: list[tuple[int, int, int]] = []
+
+        while len(remaining) >= self.batch_size:
+            selected: list[tuple[int, int, int]] = []
+            deferred: list[tuple[int, int, int]] = []
+            for position, item in enumerate(remaining):
+                if len(selected) < self.batch_size and self._compatible(
+                    item, selected, self.min_gap,
+                ):
+                    selected.append(item)
+                else:
+                    deferred.append(item)
+                if len(selected) == self.batch_size:
+                    deferred.extend(remaining[position + 1:])
+                    break
+            if len(selected) == self.batch_size:
+                batches.append([item[0] for item in selected])
+            else:
+                # A maximal greedy set can be smaller than a batch. Removing it
+                # lets later candidates form batches, and the loss is reported.
+                dropped.extend(selected)
+            remaining = deferred
+
+        dropped.extend(remaining)
+        return batches, dropped
+
+    def set_epoch(self, epoch: int) -> None:
+        """Validation order is intentionally invariant across epochs."""
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        yield from (list(batch) for batch in self._batches)
 

@@ -42,7 +42,8 @@ _CONFIG_KEYS = {
         "log_every", "watch_model",
     },
     "alignment_eval": {
-        "enabled", "retrieval_every_n_epochs", "visualize_every_n_epochs",
+        "enabled", "retrieval_every_n_steps", "retrieval_every_n_epochs",
+        "visualize_every_n_epochs",
         "retrieval_max_pairs", "visualization_max_pairs", "min_window_start_gap",
         "random_seed", "run_on_training_end", "save_local_figures",
     },
@@ -244,6 +245,10 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
 
     alignment = sections["alignment_eval"]
     _boolean(alignment.enabled, "alignment_eval.enabled")
+    _integer(
+        alignment.retrieval_every_n_steps,
+        "alignment_eval.retrieval_every_n_steps", minimum=0,
+    )
     _integer(
         alignment.retrieval_every_n_epochs,
         "alignment_eval.retrieval_every_n_epochs", minimum=1,

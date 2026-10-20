@@ -24,7 +24,9 @@ from utils.alignment import (
     matching_segments,
     save_alignment_selection,
     select_alignment_indices,
+    should_run_epoch_alignment,
     should_run_final_alignment,
+    should_run_step_alignment,
     similarity_distributions,
 )
 
@@ -236,6 +238,44 @@ class AlignmentTests(unittest.TestCase):
             run_on_training_end=True,
             current_step=13,
             last_evaluated_step=13,
+        ))
+
+    def test_step_trigger_uses_optimizer_steps_and_deduplicates(self) -> None:
+        evaluated = -1
+        triggered = []
+        for step in range(1, 3001):
+            if should_run_step_alignment(
+                enabled=True,
+                retrieval_every_n_steps=1000,
+                current_step=step,
+                last_evaluated_step=evaluated,
+            ):
+                triggered.append(step)
+                evaluated = step
+        self.assertEqual(triggered, [1000, 2000, 3000])
+        self.assertFalse(should_run_step_alignment(
+            enabled=True,
+            retrieval_every_n_steps=1000,
+            current_step=3000,
+            last_evaluated_step=3000,
+        ))
+        self.assertFalse(should_run_step_alignment(
+            enabled=True,
+            retrieval_every_n_steps=0,
+            current_step=1000,
+            last_evaluated_step=-1,
+        ))
+        self.assertFalse(should_run_epoch_alignment(
+            enabled=True,
+            scheduled=True,
+            current_step=3000,
+            last_evaluated_step=3000,
+        ))
+        self.assertFalse(should_run_final_alignment(
+            enabled=True,
+            run_on_training_end=True,
+            current_step=3000,
+            last_evaluated_step=3000,
         ))
 
 

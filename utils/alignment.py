@@ -410,6 +410,34 @@ def alignment_schedule(
     return retrieve or visualize, visualize
 
 
+def should_run_step_alignment(
+    *,
+    enabled: bool,
+    retrieval_every_n_steps: int,
+    current_step: int,
+    last_evaluated_step: int,
+) -> bool:
+    """Schedule retrieval on 1-based optimizer steps without duplicates."""
+    return (
+        enabled
+        and retrieval_every_n_steps > 0
+        and current_step > 0
+        and current_step % retrieval_every_n_steps == 0
+        and current_step != last_evaluated_step
+    )
+
+
+def should_run_epoch_alignment(
+    *,
+    enabled: bool,
+    scheduled: bool,
+    current_step: int,
+    last_evaluated_step: int,
+) -> bool:
+    """Run an epoch trigger only if this model step was not evaluated."""
+    return enabled and scheduled and current_step != last_evaluated_step
+
+
 def should_run_final_alignment(
     *,
     enabled: bool,

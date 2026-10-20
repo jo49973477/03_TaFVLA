@@ -196,11 +196,18 @@ no file is added to or changed in the source dataset.
 Pressure mean/std is stored per 12x12 taxel and wrench mean/std per ordered 6D
 component. Statistics use unique frames from the training groups only, not
 overlapping windows and never validation data. They are stored both in model
-buffers and checkpoint metadata. A batch sampler greedily separates nearby
-windows from the same episode when alternatives exist. This reduces adjacent
-false negatives, but cannot eliminate semantically similar negatives across a
-continuous dataset. Gradient accumulation also does not enlarge the InfoNCE
-negative set: only pairs in one forward pass are negatives.
+buffers and checkpoint metadata. Training uses the shuffled
+`TemporalDiverseBatchSampler`. Validation reuses its compatibility rule through
+a fixed-seed evaluation sampler: every emitted batch is full sized, and windows
+from the same episode have starts separated by at least
+`max(data.window_size, training.min_same_episode_window_gap)`. The fixed batch
+plan and order are reused at every validation call. Candidate, used, and
+dropped sample counts plus the number of violating batches are written to
+`metrics.jsonl` and printed at startup; failure to form one valid full batch is
+an error rather than a silent batch-size change. This reduces adjacent false
+negatives, but cannot eliminate temporally distant samples with the same
+semantic or physical state. Gradient accumulation also does not enlarge the
+InfoNCE negative set: only pairs in one forward pass are negatives.
 
 Checkpoints contain model/optimizer/scaler state, normalization, split groups,
 config, step/epoch, alignment-evaluation state, and RNG state. Older checkpoints
@@ -265,7 +272,7 @@ chart. In a run workspace, use **Add panel → Line plot**, choose
   `val/force_codebook_perplexity`
 - **Cross-Modal Retrieval**: `alignment/t2f/recall_at_1`,
   `alignment/t2f/recall_at_5`, `alignment/t2f/mrr`,
-  `alignment/t2f/hard_negative_margin` with `completed_epoch` as X
+  `alignment/t2f/hard_negative_margin` with `global_step` as X
 
 Alignment images are logged under `alignment/visualization/*` with both
 `completed_epoch` and the actual optimizer `global_step` in their record and
@@ -321,6 +328,7 @@ The default configuration is:
 ```yaml
 alignment_eval:
   enabled: true
+  retrieval_every_n_steps: 1000
   retrieval_every_n_epochs: 1
   visualize_every_n_epochs: 5
   retrieval_max_pairs: 256
@@ -344,11 +352,36 @@ uv run python -m script.train_adapter \
 ```
 
 An epoch metric is emitted only after every training batch for that epoch was
-consumed. `completed_epoch` is 1-based and is stored in checkpoints. If
-`max_steps` stops inside an epoch, `run_on_training_end=true` performs a
-retrieval-only record labeled `final`; if no epoch completed, the terminal UI
-explicitly shows `Final (no completed epoch)`. An evaluation already performed
-at the same final model step is not duplicated.
+consumed. Step retrieval is based on completed optimizer updates, not gradient
+accumulation micro-steps; `retrieval_every_n_steps=0` disables only this step
+schedule. Step evaluations reuse the same saved validation pairs and skip UMAP
+and Matplotlib. `completed_epoch` is 1-based and is stored in checkpoints. If a
+step trigger lands on an epoch boundary, the single evaluation is epoch-labeled
+so the epoch visualization schedule is preserved. If `max_steps` stops inside
+an epoch, `run_on_training_end=true` performs a retrieval-only record labeled
+`final` unless that exact model/global step was already evaluated. Step, epoch,
+and final triggers therefore never encode the same model twice.
+
+The ordinary `val/*` metrics and fixed 256-pair `alignment/*` metrics are
+different protocols. Ordinary validation computes the unchanged training loss
+over deterministic, full-size temporally diverse mini-batches (up to
+`training.validation_batches`, still 50 by default). Alignment evaluation
+embeds its separate fixed subset and performs complete-candidate bidirectional
+retrieval. Neither protocol replaces the other.
+
+To compare legacy contiguous validation batches with the new sampler at an
+existing checkpoint without an optimizer update, run:
+
+```bash
+uv run python -m script.evaluate_validation_sampling \
+  data.root_dir=/path/to/TaF-Dataset \
+  training.resume=outputs/taf_adapter/step_00020000.pt
+```
+
+The command prints and saves
+`outputs/taf_adapter/validation_sampling_comparison.json`, including both
+protocol descriptions, metrics, evaluated sample counts, dropped samples, and
+`"training_performed": false`.
 
 Every visualization interval produces:
 

@@ -135,6 +135,8 @@ class TrainingProgress:
             alignment_title = "Final (no completed epoch)"
         elif evaluation_label == "final":
             alignment_title = f"Final after Epoch {completed_epoch}"
+        elif evaluation_label == "step":
+            alignment_title = f"Step {int(alignment.get('global_step', 0))}"
         else:
             alignment_title = f"Epoch {completed_epoch}"
         return [
@@ -317,10 +319,10 @@ class ExperimentLogger:
             self.run.define_metric("val/*", step_metric="global_step")
             self.run.define_metric("epoch", step_metric="global_step")
             self.run.define_metric("completed_epoch")
-            self.run.define_metric("alignment/*", step_metric="completed_epoch")
-            self.run.define_metric("alignment/t2f/*", step_metric="completed_epoch")
-            self.run.define_metric("alignment/f2t/*", step_metric="completed_epoch")
-            self.run.define_metric("alignment/visualization/*", step_metric="completed_epoch")
+            self.run.define_metric("alignment/*", step_metric="global_step")
+            self.run.define_metric("alignment/t2f/*", step_metric="global_step")
+            self.run.define_metric("alignment/f2t/*", step_metric="global_step")
+            self.run.define_metric("alignment/visualization/*", step_metric="global_step")
             if bool(self.config.watch_model):
                 self.run.watch(model, log="gradients", log_freq=int(self.config.log_every))
             self.message(

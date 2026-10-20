@@ -19,7 +19,9 @@ from utils.alignment import (
     evaluate_alignment,
     save_alignment_selection,
     select_alignment_indices,
+    should_run_epoch_alignment,
     should_run_final_alignment,
+    should_run_step_alignment,
 )
 from utils.checkpoint import (
     capture_rng,
@@ -31,6 +33,7 @@ from utils.checkpoint import (
 from utils.common import resolve_path, resolved_config, set_seed, validate_config
 from utils.config import register_config_schema
 from utils.data import (
+    FixedValidationBatchSampler,
     TemporalDiverseBatchSampler,
     audit_temporal_alignment,
     compute_normalization,
@@ -119,6 +122,7 @@ def _run_alignment_evaluation(
         "global_step": global_step,
         "completed_epoch": completed_epoch,
         "evaluation_label": evaluation_label,
+        "alignment/evaluation_label": evaluation_label,
         "alignment/is_final": evaluation_label == "final",
         "alignment/sample_count": len(result.tactile),
         "alignment/visualized": visualize,
@@ -242,13 +246,25 @@ def run_training(cfg: DictConfig) -> None:
         pin_memory=device.type == "cuda",
         persistent_workers=workers > 0,
     )
+    validation_gap = max(
+        int(data_cfg.window_size), int(train_cfg.min_same_episode_window_gap),
+    )
+    validation_sampler = FixedValidationBatchSampler(
+        dataset,
+        val_indices,
+        batch_size=int(train_cfg.batch_size),
+        min_gap=validation_gap,
+        seed=int(data_cfg.split_seed),
+    )
+    validation_generator = torch.Generator()
+    validation_generator.manual_seed(int(data_cfg.split_seed))
     val_loader = DataLoader(
         Subset(dataset, val_indices),
-        batch_size=int(train_cfg.batch_size),
-        shuffle=False,
+        batch_sampler=validation_sampler,
         num_workers=workers,
         pin_memory=device.type == "cuda",
         persistent_workers=workers > 0,
+        generator=validation_generator,
     )
 
     output_dir = resolve_path(train_cfg.output_dir)
@@ -320,6 +336,25 @@ def run_training(cfg: DictConfig) -> None:
     finally:
         # Experiment tracking must not change training randomness.
         restore_rng_state(rng_before_wandb)
+    validation_sampling_record: dict[str, Any] = {
+        "record_type": "validation_sampling",
+        **{
+            f"val/sampling_{key}": value
+            for key, value in validation_sampler.report.as_dict().items()
+        },
+    }
+    logger.write(validation_sampling_record)
+    logger.message(
+        "Fixed validation sampling: "
+        f"{validation_sampler.report.batch_count} full batches x "
+        f"{validation_sampler.report.batch_size}, "
+        f"used={validation_sampler.report.used_samples}/"
+        f"{validation_sampler.report.candidate_samples}, "
+        f"dropped={validation_sampler.report.dropped_samples}, "
+        f"same-episode start gap >= {validation_sampler.report.min_window_start_gap}, "
+        f"violating_batches={validation_sampler.report.violating_batches}, "
+        f"seed={validation_sampler.report.seed}"
+    )
     max_steps = int(train_cfg.max_steps)
     logger.start_progress(max_steps, initial_step=step)
     accumulation = int(train_cfg.gradient_accumulation_steps)
@@ -335,6 +370,10 @@ def run_training(cfg: DictConfig) -> None:
             batch_sampler.set_epoch(epoch)
             model.train()
             epoch_completed = False
+            # The sampler uses only a local RNG, so counting its deterministic
+            # plan cannot perturb the actual DataLoader or training RNG.
+            epoch_batch_count = sum(1 for _ in batch_sampler)
+            epoch_batch_number = 0
             train_iterator = iter(train_loader)
             while True:
                 try:
@@ -342,6 +381,8 @@ def run_training(cfg: DictConfig) -> None:
                 except StopIteration:
                     epoch_completed = True
                     break
+                epoch_batch_number += 1
+                is_last_epoch_batch = epoch_batch_number == epoch_batch_count
                 tactile = batch["tactile"].to(device, non_blocking=True)
                 force = batch["force"].to(device, non_blocking=True)
                 pressure = batch["pressure"].to(device, non_blocking=True)
@@ -411,15 +452,85 @@ def run_training(cfg: DictConfig) -> None:
                         if train_cfg.validation_batches is not None
                         else None,
                     )
-                    val_record = {"step": step, "epoch": epoch, **val_metrics}
+                    requested_validation_batches = (
+                        int(train_cfg.validation_batches)
+                        if train_cfg.validation_batches is not None
+                        else None
+                    )
+                    evaluated_validation_batches = min(
+                        len(validation_sampler),
+                        requested_validation_batches
+                        if requested_validation_batches is not None
+                        else len(validation_sampler),
+                    )
+                    val_diagnostics = {
+                        "val/evaluated_batches": evaluated_validation_batches,
+                        "val/evaluated_samples": (
+                            evaluated_validation_batches * int(train_cfg.batch_size)
+                        ),
+                        "val/sampling_dropped_samples": (
+                            validation_sampler.report.dropped_samples
+                        ),
+                        "val/sampling_min_window_start_gap": validation_gap,
+                    }
+                    val_record = {
+                        "step": step,
+                        "epoch": epoch,
+                        **val_diagnostics,
+                        **val_metrics,
+                    }
                     logger.write(val_record)
                     logger.update_validation(val_record)
                     wandb_payload.update(val_metrics)
+                    wandb_payload.update(val_diagnostics)
                     wandb_payload.update(optimization)
                     model.train()
 
                 if wandb_payload:
                     logger.log_wandb(wandb_payload, step)
+
+                if should_run_step_alignment(
+                    enabled=bool(cfg.alignment_eval.enabled),
+                    retrieval_every_n_steps=int(
+                        cfg.alignment_eval.retrieval_every_n_steps
+                    ),
+                    current_step=step,
+                    last_evaluated_step=int(alignment_state["last_evaluated_step"]),
+                ):
+                    assert alignment_loader is not None
+                    next_completed_epoch = completed_epochs + 1
+                    epoch_due, epoch_visualize = alignment_schedule(
+                        next_completed_epoch,
+                        retrieval_every_n_epochs=int(
+                            cfg.alignment_eval.retrieval_every_n_epochs
+                        ),
+                        visualize_every_n_epochs=int(
+                            cfg.alignment_eval.visualize_every_n_epochs
+                        ),
+                    )
+                    # At an epoch boundary, one epoch-labelled evaluation takes
+                    # precedence so its visualization schedule is preserved.
+                    evaluation_label = (
+                        "epoch" if is_last_epoch_batch and epoch_due else "step"
+                    )
+                    alignment_state.update(_run_alignment_evaluation(
+                        model=model,
+                        loader=alignment_loader,
+                        device=device,
+                        cfg=cfg,
+                        output_dir=output_dir,
+                        logger=logger,
+                        global_step=step,
+                        completed_epoch=(
+                            next_completed_epoch
+                            if evaluation_label == "epoch"
+                            else completed_epochs
+                        ),
+                        evaluation_label=evaluation_label,
+                        visualize=(
+                            epoch_visualize if evaluation_label == "epoch" else False
+                        ),
+                    ))
 
                 if step % int(train_cfg.save_every) == 0:
                     save_checkpoint(
@@ -457,7 +568,12 @@ def run_training(cfg: DictConfig) -> None:
                         cfg.alignment_eval.visualize_every_n_epochs
                     ),
                 )
-                if bool(cfg.alignment_eval.enabled) and should_evaluate:
+                if should_run_epoch_alignment(
+                    enabled=bool(cfg.alignment_eval.enabled),
+                    scheduled=should_evaluate,
+                    current_step=step,
+                    last_evaluated_step=int(alignment_state["last_evaluated_step"]),
+                ):
                     assert alignment_loader is not None
                     alignment_state.update(_run_alignment_evaluation(
                         model=model,
